@@ -441,6 +441,20 @@ bool writeMineState(const std::string& workdir, std::map<std::string, std::strin
     return writeKeyValueFile(mineStatePath(workdir), state);
 }
 
+// For run-jobs specifically: this file only exists so `job-status` has
+// something current to report -- it's not consensus state and nothing
+// downstream depends on it being written successfully. A transient
+// filesystem hiccup writing it (disk pressure, a permissions blip) must
+// not be a reason to kill an otherwise-healthy mining/syncing process;
+// that would be exactly the "died silently, needs a human to notice and
+// restart it by hand" failure mode this whole function already goes out
+// of its way to avoid for network/sync problems. Warn and keep going.
+void writeMineStateBestEffort(const std::string& workdir, const std::map<std::string, std::string>& state) {
+    if (!writeMineState(workdir, state)) {
+        std::cerr << "could not write job state file for " << workdir << "\n";
+    }
+}
+
 
 bool ensureWorkdirLayout(const std::string& workdir) {
     return ensureDirectory(workdir) && ensureDirectory(dataDir(workdir)) && ensureDirectory(walletsDir(workdir))
@@ -5528,15 +5542,31 @@ int runJobs(const char* argv0, int argc, char** argv) {
     state["status"] = "syncing";
     state["updated_at"] = nowSeconds();
     state["last_result"] = "syncing-before-mine";
-    if (!writeMineState(workdir, state)) return 1;
+    writeMineStateBestEffort(workdir, state);
 
-    int rc = syncWorkdir(argv0, workdir, *peer);
-    if (rc != 0) {
-        state["status"] = "failed";
+    // A failure here (most often the local store being corrupted and
+    // needing an external chain-recover, occasionally just a peer that's
+    // temporarily unreachable) must not kill the whole run-jobs process --
+    // it's meant to run unattended, and "exited silently, needs a human to
+    // notice and restart it by hand" is exactly the failure mode the
+    // stagnation-timeout logic further down already exists to avoid for a
+    // slow network. Local corruption doesn't resolve itself by retrying
+    // the same sync call, but it's not this process's job to fix that --
+    // just to not die while waiting for someone/something else to. Once
+    // the store is recovered externally, this picks back up on its own.
+    int rc;
+    int initial_sync_attempts = 0;
+    while (true) {
+        rc = syncWorkdir(argv0, workdir, *peer);
+        if (rc == 0) break;
+        ++initial_sync_attempts;
+        state["status"] = "syncing";
         state["updated_at"] = nowSeconds();
-        state["last_result"] = "sync-before-mine-failed";
-        writeMineState(workdir, state);
-        return rc;
+        state["last_result"] = "initial-sync-failed-retrying";
+        writeMineStateBestEffort(workdir, state);
+        std::cerr << "initial sync failed, retrying attempt=" << initial_sync_attempts << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            std::min<long long>(30000, 1000LL * initial_sync_attempts)));
     }
 
     auto local = loadLocalStatus(chainPath(workdir));
@@ -5545,7 +5575,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
         state["status"] = "complete";
         state["updated_at"] = nowSeconds();
         state["last_result"] = "already-at-target";
-        if (!writeMineState(workdir, state)) return 1;
+        writeMineStateBestEffort(workdir, state);
         std::cout << "JOB_COMPLETE target=" << *target << " frontier=" << local.frontier << "\n";
         return 0;
     }
@@ -5553,7 +5583,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
     state["status"] = "running";
     state["updated_at"] = nowSeconds();
     state["last_result"] = "mining";
-    if (!writeMineState(workdir, state)) return 1;
+    writeMineStateBestEffort(workdir, state);
 
     int stagnant_attempts = 0;
     constexpr int kMaxStagnantAttempts = 30;
@@ -5603,7 +5633,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
         state["status"] = "syncing";
         state["updated_at"] = nowSeconds();
         state["last_result"] = "syncing-after-stale-miner";
-        if (!writeMineState(workdir, state)) return 1;
+        writeMineStateBestEffort(workdir, state);
         const int sync_rc = syncWorkdir(argv0, workdir, *peer);
         local = loadLocalStatus(chainPath(workdir));
         state["last_synced_frontier"] = std::to_string(local.frontier);
@@ -5611,7 +5641,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
             state["status"] = "syncing";
             state["updated_at"] = nowSeconds();
             state["last_result"] = "waiting-for-race-winner";
-            if (!writeMineState(workdir, state)) return 1;
+            writeMineStateBestEffort(workdir, state);
             std::cout << "WAITING_FOR_RACE_WINNER frontier=" << before_mine.frontier
                       << " target=" << *target << "\n";
             auto advanced = waitForFrontierAdvance(
@@ -5619,7 +5649,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
             if (!advanced.has_value()) {
                 state["last_result"] = "retrying-local-miner-after-race-wait";
                 state["updated_at"] = nowSeconds();
-                if (!writeMineState(workdir, state)) return 1;
+                writeMineStateBestEffort(workdir, state);
                 std::cout << "RACE_WAIT_TIMEOUT_RETRY frontier=" << before_mine.frontier
                           << " target=" << *target << "\n";
             }
@@ -5643,13 +5673,13 @@ int runJobs(const char* argv0, int argc, char** argv) {
                 state["updated_at"] = nowSeconds();
                 state["last_result"] =
                     sync_failure_cap_hit ? "sync-after-miner-failed" : "stagnant-timeout";
-                writeMineState(workdir, state);
+                writeMineStateBestEffort(workdir, state);
                 return rc;
             }
             state["status"] = "running";
             state["updated_at"] = nowSeconds();
             state["last_result"] = sync_rc != 0 ? "retrying-after-sync-failure" : "retrying-after-stalled-race";
-            if (!writeMineState(workdir, state)) return 1;
+            writeMineStateBestEffort(workdir, state);
             std::cout << "RETRYING_LOCAL_MINER attempt=" << stagnant_attempts
                       << " frontier=" << local.frontier
                       << " target=" << *target << "\n";
@@ -5662,31 +5692,42 @@ int runJobs(const char* argv0, int argc, char** argv) {
             state["status"] = "complete";
             state["updated_at"] = nowSeconds();
             state["last_result"] = "complete-after-stale-miner";
-            if (!writeMineState(workdir, state)) return 1;
+            writeMineStateBestEffort(workdir, state);
             std::cout << "JOB_COMPLETE target=" << *target << " frontier=" << local.frontier << "\n";
             return 0;
         }
         state["status"] = "running";
         state["updated_at"] = nowSeconds();
         state["last_result"] = "continuing-after-race-progress";
-        if (!writeMineState(workdir, state)) return 1;
+        writeMineStateBestEffort(workdir, state);
     }
 
     state["status"] = "syncing";
     state["updated_at"] = nowSeconds();
     state["last_result"] = "syncing-after-mine";
-    if (!writeMineState(workdir, state)) return 1;
+    writeMineStateBestEffort(workdir, state);
 
-    rc = syncWorkdir(argv0, workdir, *peer);
+    // Same reasoning as the initial sync above: the miner subprocess just
+    // finished cleanly (it only reached this point via the loop's `break`),
+    // so a final-sync failure here is exactly as likely to be transient/
+    // externally-recoverable local corruption as the initial one was, and
+    // exiting the whole process over it is just as wrong.
+    int final_sync_attempts = 0;
+    while (true) {
+        rc = syncWorkdir(argv0, workdir, *peer);
+        if (rc == 0) break;
+        ++final_sync_attempts;
+        state["status"] = "syncing";
+        state["updated_at"] = nowSeconds();
+        state["last_result"] = "sync-after-mine-failed-retrying";
+        writeMineStateBestEffort(workdir, state);
+        std::cerr << "post-mine sync failed, retrying attempt=" << final_sync_attempts << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            std::min<long long>(30000, 1000LL * final_sync_attempts)));
+    }
     local = loadLocalStatus(chainPath(workdir));
     state["last_synced_frontier"] = std::to_string(local.frontier);
     state["updated_at"] = nowSeconds();
-    if (rc != 0) {
-        state["status"] = "failed";
-        state["last_result"] = "sync-after-mine-failed";
-        writeMineState(workdir, state);
-        return rc;
-    }
     if (local.frontier >= *target) {
         state["status"] = "complete";
         state["last_result"] = "complete";
@@ -5694,7 +5735,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
         state["status"] = "pending";
         state["last_result"] = "frontier-below-target";
     }
-    if (!writeMineState(workdir, state)) return 1;
+    writeMineStateBestEffort(workdir, state);
     std::cout << (local.frontier >= *target ? "JOB_COMPLETE" : "JOB_PENDING")
               << " target=" << *target << " frontier=" << local.frontier << "\n";
     return local.frontier >= *target ? 0 : 1;
