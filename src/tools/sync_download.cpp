@@ -8,6 +8,8 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -57,6 +59,18 @@ std::optional<Socket> connectToServer(const std::string& host, int port) {
         return std::nullopt;
     }
 
+    // See sync_query.cpp's connectToServer for why this exists (a peer
+    // that accepts and then goes silent otherwise blocks recv() forever)
+    // and why connect() itself needs the nonblocking+select() dance
+    // rather than just relying on SO_SNDTIMEO. This only bounds each
+    // individual read, not the whole download, so a normal multi-record
+    // transfer that's simply slow (not stalled) is unaffected.
+    timeval timeout{};
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<std::uint16_t>(port));
@@ -65,11 +79,49 @@ std::optional<Socket> connectToServer(const std::string& host, int port) {
         close(fd);
         return std::nullopt;
     }
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        std::cerr << "could not configure nonblocking connect: " << std::strerror(errno) << "\n";
+        close(fd);
+        return std::nullopt;
+    }
+
+    const int connected = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (connected != 0 && errno != EINPROGRESS) {
         std::cerr << "connect failed: " << std::strerror(errno) << "\n";
         close(fd);
         return std::nullopt;
     }
+
+    if (connected != 0) {
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(fd, &write_set);
+        timeval connect_timeout{};
+        connect_timeout.tv_sec = 5;
+        connect_timeout.tv_usec = 0;
+        const int ready = select(fd + 1, nullptr, &write_set, nullptr, &connect_timeout);
+        if (ready <= 0) {
+            std::cerr << "connect timed out\n";
+            close(fd);
+            return std::nullopt;
+        }
+        int socket_error = 0;
+        socklen_t socket_error_size = sizeof(socket_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) != 0 || socket_error != 0) {
+            std::cerr << "connect failed: " << std::strerror(socket_error != 0 ? socket_error : errno) << "\n";
+            close(fd);
+            return std::nullopt;
+        }
+    }
+
+    if (fcntl(fd, F_SETFL, flags) != 0) {
+        std::cerr << "could not restore blocking socket mode: " << std::strerror(errno) << "\n";
+        close(fd);
+        return std::nullopt;
+    }
+
     return Socket(fd);
 }
 
