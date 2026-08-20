@@ -455,6 +455,23 @@ void writeMineStateBestEffort(const std::string& workdir, const std::map<std::st
     }
 }
 
+// Plain `1000ms * attempt` (capped at 30s) is deterministic -- two
+// run-jobs processes that happened to start at the same instant (e.g. a
+// multi-miner fleet booting together) retry at the exact same wall-clock
+// moments forever, so every retry collides with the other's and both
+// keep re-triggering the very "connection limit exceeded" congestion
+// they're backing off from. Confirmed live: two Fly.io miners stuck in
+// lockstep, 40+ retries, neither ever landing a clean window alone.
+// +/-30% jitter is enough to desynchronize two colliding processes
+// within a few rounds without meaningfully changing the backoff curve
+// for the normal single-process case.
+long long jitteredBackoffMs(int attempt) {
+    const long long base = std::min<long long>(30000, 1000LL * attempt);
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<double> jitter(0.7, 1.3);
+    return static_cast<long long>(base * jitter(rng));
+}
+
 
 bool ensureWorkdirLayout(const std::string& workdir) {
     return ensureDirectory(workdir) && ensureDirectory(dataDir(workdir)) && ensureDirectory(walletsDir(workdir))
@@ -5565,8 +5582,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
         state["last_result"] = "initial-sync-failed-retrying";
         writeMineStateBestEffort(workdir, state);
         std::cerr << "initial sync failed, retrying attempt=" << initial_sync_attempts << "\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            std::min<long long>(30000, 1000LL * initial_sync_attempts)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(jitteredBackoffMs(initial_sync_attempts)));
     }
 
     auto local = loadLocalStatus(chainPath(workdir));
@@ -5722,8 +5738,7 @@ int runJobs(const char* argv0, int argc, char** argv) {
         state["last_result"] = "sync-after-mine-failed-retrying";
         writeMineStateBestEffort(workdir, state);
         std::cerr << "post-mine sync failed, retrying attempt=" << final_sync_attempts << "\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            std::min<long long>(30000, 1000LL * final_sync_attempts)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(jitteredBackoffMs(final_sync_attempts)));
     }
     local = loadLocalStatus(chainPath(workdir));
     state["last_synced_frontier"] = std::to_string(local.frontier);
